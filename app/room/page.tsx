@@ -6,11 +6,12 @@ import Peer from 'simple-peer';
 import { database } from '../../lib/firebaseConfig';
 import {
   ref,
-  onValue,
   set,
-  remove,
   push,
   DataSnapshot,
+  get,
+  onChildAdded,
+  off,
 } from 'firebase/database';
 
 export default function RoomPage() {
@@ -19,39 +20,48 @@ export default function RoomPage() {
   const company = searchParams.get('company');
 
   const [isMatched, setIsMatched] = useState(false);
+  const [error, setError] = useState<string | null>(null);
 
   const myVideo = useRef<HTMLVideoElement>(null);
   const partnerVideo = useRef<HTMLVideoElement>(null);
-  const peerRef = useRef<Peer.Instance>();
-  const signalsRef = useRef<any>();
+  const peerRef = useRef<Peer.Instance | null>(null);
+  const signalsRef = useRef<any>(null);
 
   useEffect(() => {
     if (!company) return;
 
     const roomRef = ref(database, `rooms/${company}`);
 
-    // Check if room exists
-    onValue(roomRef, (snapshot: DataSnapshot) => {
-      if (snapshot.exists()) {
-        // Room exists, join as second participant
-        joinRoom(false, roomRef);
-      } else {
-        // Create room and wait for partner
+    // Determine if the user is the initiator
+    get(roomRef).then((snapshot: DataSnapshot) => {
+      const isInitiator = !snapshot.exists();
+
+      if (isInitiator) {
+        // Create the room
         set(roomRef, { created: true }).then(() => {
+          console.log(`Room created: ${company}`);
           joinRoom(true, roomRef);
         });
+      } else {
+        console.log(`Joining existing room: ${company}`);
+        joinRoom(false, roomRef);
       }
     });
 
     return () => {
       if (signalsRef.current) {
-        remove(signalsRef.current);
+        off(signalsRef.current);
+      }
+      if (peerRef.current) {
+        peerRef.current.destroy();
       }
     };
   }, [company]);
 
   const joinRoom = async (initiator: boolean, roomRef: any) => {
     try {
+      console.log(`Initiator: ${initiator}`);
+
       const stream = await navigator.mediaDevices.getUserMedia({
         video: true,
         audio: true,
@@ -67,41 +77,57 @@ export default function RoomPage() {
         stream: stream,
       });
 
-      peer.on('signal', (signalData) => {
+      peer.on('signal', async (signalData) => {
+        console.log('Sending signal:', signalData);
         const signalsRef = ref(database, `rooms/${company}/signals`);
-        const newSignalRef = push(signalsRef);
-        set(newSignalRef, {
+        await push(signalsRef, {
           signal: signalData,
           initiator: initiator,
         });
       });
 
       peer.on('stream', (streamData) => {
+        console.log('Received remote stream');
         if (partnerVideo.current) {
           partnerVideo.current.srcObject = streamData;
         }
       });
 
+      peer.on('connect', () => {
+        console.log('Peer connected');
+      });
+
+      peer.on('error', (err) => {
+        console.error('Peer error:', err);
+        setError('An error occurred with the peer connection.');
+      });
+
       peerRef.current = peer;
 
-      // Listen for signals from the database
+      // Listen for new signals from Firebase
       signalsRef.current = ref(database, `rooms/${company}/signals`);
-      onValue(signalsRef.current, (snapshot: DataSnapshot) => {
-        snapshot.forEach((childSnapshot) => {
-          const data = childSnapshot.val();
-          if (data.initiator !== initiator) {
-            peer.signal(data.signal);
+
+      onChildAdded(signalsRef.current, (snapshot) => {
+        const data = snapshot.val();
+        console.log('Received signal from Firebase:', data);
+
+        if (data.initiator !== initiator) {
+          peer.signal(data.signal);
+          if (!isMatched) {
             setIsMatched(true);
+            console.log('Connection established with peer');
           }
-        });
+        }
       });
-    } catch (error) {
-      console.error('Error accessing media devices.', error);
+    } catch (err) {
+      console.error('Error accessing media devices.', err);
+      setError('Unable to access camera and microphone.');
     }
   };
 
   return (
     <div className="flex flex-col items-center h-screen bg-gray-100">
+      {error && <p className="text-red-500">{error}</p>}
       {!isMatched ? (
         <h2 className="text-2xl font-bold mt-10">Waiting for a partner...</h2>
       ) : (
